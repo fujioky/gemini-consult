@@ -1,0 +1,8 @@
+{
+  "model": "gemini-4-argon-high",
+  "max_running": 4,
+  "mask": [
+    "~/.config/some-private-tool",
+    "/path/to/other/repo/.secrets"
+  ]
+}

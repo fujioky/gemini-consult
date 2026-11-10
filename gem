@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""gem：找 Gemini 的唯一入口。
+
+Claude 用：  main / broker / post / reply / wait
+调度员用：   board / open / say / nudge / ls / read / delivered / close / watch
+检查沙箱：   selftest
+
+gem 不替谁做判断。它只记录：Gemini 每一轮读到主会话的哪里，之后主会话又多了几轮
+（用户发的、后台通知等别的）、过了多久。要不要催、什么时候递，调度员看着办。
+
+项目目录：环境变量 GEM_PROJECT > skill 装在 <项目>/.claude/skills/ 下就是那个项目 > 当前目录
+状态目录：环境变量 GEM_ROOT > skill 目录里的 .gem_root > <项目>/.gemini-consult
+配置：    <状态目录>/config.json（可选）：{"model": ..., "max_running": ..., "mask": [要遮住的路径]}
+  main.json                   主会话记录路径和会话 ID
+  progress.json               主会话累计开了几轮（只读新写的部分）
+  board/P0007.json            Claude 的帖子
+  replies.jsonl               Claude 对回答的回应
+  delivered.jsonl             已经递给 Claude 的回答
+  convs/<对话>/meta.json      agy 对话 ID、第几轮、状态、这一轮开始时主会话到了哪
+  convs/<对话>/in/NNN.md      第 NNN 轮发给 Gemini 的消息和快照（沙箱只露这个目录）
+  convs/<对话>/out/NNN.md     第 NNN 轮的回答；回答编号是 <对话>#NNN
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SKILL = Path(__file__).resolve().parent
+
+
+def _project():
+    if os.environ.get("GEM_PROJECT"):
+        return Path(os.environ["GEM_PROJECT"]).expanduser().resolve()
+    p = SKILL.parents
+    if len(p) > 2 and p[0].name == "skills" and p[1].name == ".claude" and p[2] != Path.home():
+        return p[2]
+    return Path.cwd()
+
+
+PROJECT = _project()
+_root_file = SKILL / ".gem_root"
+ROOT = Path(os.environ.get("GEM_ROOT") or (_root_file.read_text().strip() if _root_file.exists()
+                                             else str(PROJECT / ".gemini-consult")))
+try:
+    CONFIG = json.loads((ROOT / "config.json").read_text())
+except FileNotFoundError:
+    CONFIG = {}
+os.environ.update(GEM_ROOT=str(ROOT), GEM_PROJECT=str(PROJECT),    # 传给沙箱脚本和快照过滤
+                  GEM_MASK=":".join(os.path.expanduser(x) for x in CONFIG.get("mask", [])))
+sys.path.insert(0, str(SKILL))
+import snapshot  # noqa: E402  （放在设好 GEM_ROOT 之后：它要据此认出顾问往来的路径）
+
+AGY = os.environ.get("GEM_AGY", str(SKILL / "agy_consult.sh"))       # 测试时可换成假的
+CONV_STORE = Path(os.environ.get("GEM_CONV_STORE",
+                                 str(Path.home() / ".gemini/antigravity-cli/conversations")))
+MODEL = os.environ.get("GEM_MODEL", CONFIG.get("model", "gemini-4-argon-high"))
+MAX_RUNNING = int(os.environ.get("GEM_MAX_RUNNING", CONFIG.get("max_running", 4)))
+NUDGE = "时间到。按你已经看到的，先说你现在的看法，再说你还想查什么。不要再读新东西。"
+
+BOARD, CONVS = ROOT / "board", ROOT / "convs"
+REPLIES, DELIVERED, SEEN = ROOT / "replies.jsonl", ROOT / "delivered.jsonl", ROOT / "seen.json"
+MAIN, PROGRESS = ROOT / "main.json", ROOT / "progress.json"
+
+
+# ---------- 小工具 ----------
+
+def now():
+    return time.time()
+
+
+def jload(p, default=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except FileNotFoundError:
+        return default
+
+
+def jsave(p, obj):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1))
+    tmp.replace(p)
+
+
+def jlines(p):
+    try:
+        return [json.loads(x) for x in Path(p).read_text().splitlines() if x.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def jappend(p, obj):
+    Path(p).parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+class Lock:
+    def __init__(self, name):
+        self.path = ROOT / f".{name}.lock"
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.path, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+class NoLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+
+def die(msg):
+    sys.exit(msg)
+
+
+# ---------- 主会话又发生了多少 ----------
+
+def progress():
+    """主会话累计 {byte, human, other, posts, t}。只读上次之后新写的部分。"""
+    m = jload(MAIN)
+    if not m:
+        return None
+    with Lock("progress"):
+        p = jload(PROGRESS)
+        if not p or p["path"] != m["path"]:
+            p = {"path": m["path"], "byte": 0, "human": 0, "other": 0}
+        c = snapshot.count(m["path"], p["byte"])
+        p.update(byte=c["to_byte"], human=p["human"] + c["human"], other=p["other"] + c["other"],
+                 posts=len(list(BOARD.glob("P*.json"))) if BOARD.exists() else 0, t=now())
+        jsave(PROGRESS, p)
+        return p
+
+
+def distance(ref, prog):
+    """从 ref 那一刻到现在：主会话多了几轮、Claude 多发了几个帖、过了多久。只是记录，不下结论。"""
+    if not ref or not prog:
+        return ""
+    mins = int((prog["t"] - ref["t"]) / 60)
+    return (f"之后你发了 {prog['human'] - ref['human']} 轮，后台通知等 {prog['other'] - ref['other']} 轮，"
+            f"Claude 新帖 {prog.get('posts', 0) - ref.get('posts', 0)} 个，过了 {mins} 分钟")
+
+
+# ---------- 对话和轮次 ----------
+
+def meta(name):
+    m = jload(CONVS / name / "meta.json")
+    if not m:
+        die(f"没有对话 {name}")
+    return m
+
+
+def save_meta(m):
+    jsave(CONVS / m["name"] / "meta.json", m)
+
+
+def all_metas():
+    if not CONVS.exists():
+        return []
+    ms = [jload(d / "meta.json") for d in CONVS.iterdir() if (d / "meta.json").exists()]
+    return sorted(ms, key=lambda m: m["created"])
+
+
+def paths(name, n):
+    d = CONVS / name
+    return {"in": d / "in" / f"{n:03d}.md", "snap": d / "in" / f"{n:03d}-snap.md",
+            "out": d / "out" / f"{n:03d}.md", "log": d / "run" / f"{n:03d}.log",
+            "pid": d / "run" / f"{n:03d}.pid", "exit": d / "run" / f"{n:03d}.exit"}
+
+
+def turn_state(name, n):
+    p = paths(name, n)
+    if p["exit"].exists():
+        code = p["exit"].read_text().strip()
+        return "answered" if code == "0" else f"error({code})"
+    if p["pid"].exists():
+        try:
+            os.kill(int(p["pid"].read_text()), 0)
+            return "running"
+        except (ProcessLookupError, ValueError):
+            return "stopped"
+    return "queued" if p["in"].exists() else "none"
+
+
+def running_count():
+    return sum(1 for m in all_metas() if m["state"] == "running")
+
+
+def grab_new_conv_id(before, wait=30):
+    """新开对话时，从 agy 的对话目录里找新出现的 .db（lab 上实测可行）。"""
+    t0 = now()
+    while now() - t0 < wait:
+        if CONV_STORE.exists():
+            new = {f for f in os.listdir(CONV_STORE) if f.endswith(".db")} - before
+            if len(new) == 1:
+                return next(iter(new))[:-3]
+        time.sleep(1)
+    return None
+
+
+def launch(m):
+    """起 m 的当前轮。到并发上限就保持 queued，等 refresh() 再起。
+    不套 timeout：它会把 agy 放进自己的进程组，停这一轮时就杀不干净。"""
+    if running_count() >= MAX_RUNNING:
+        return
+    name, n = m["name"], m["turn"]
+    p = paths(name, n)
+    for k in ("out", "log"):
+        p[k].parent.mkdir(parents=True, exist_ok=True)
+    cmd = [AGY, name, "--model", MODEL]
+    if m.get("conv_id"):
+        cmd += ["--conversation", m["conv_id"]]
+    cmd += [f"-p={p['in'].read_text()}"]
+    first = not m.get("conv_id")
+    with Lock("open") if first else NoLock():
+        before = set(os.listdir(CONV_STORE)) if first and CONV_STORE.exists() else set()
+        with open(p["out"], "w") as out, open(p["log"], "w") as log:
+            proc = subprocess.Popen(
+                ["bash", "-c", '"$@"; echo $? > "$0"', str(p["exit"])] + cmd,
+                stdout=out, stderr=log, stdin=subprocess.DEVNULL,
+                cwd=str(PROJECT), start_new_session=True)
+        p["pid"].write_text(str(proc.pid))
+        m.update(state="running", started=now())
+        save_meta(m)
+        if first:
+            m["conv_id"] = grab_new_conv_id(before)
+            save_meta(m)
+
+
+def kill_turn(m):
+    try:
+        os.killpg(int(paths(m["name"], m["turn"])["pid"].read_text()), signal.SIGTERM)
+    except (ProcessLookupError, ValueError, FileNotFoundError):
+        pass
+
+
+def refresh():
+    """收尾跑完的轮次，有空位就起排队的。每个命令开头都调一次。"""
+    prog = progress()
+    for m in all_metas():
+        if m["state"] == "running":
+            s = turn_state(m["name"], m["turn"])
+            if s != "running":
+                m.update(state="idle" if s == "answered" else s, done_ref=prog)
+                save_meta(m)
+    for m in all_metas():
+        if m["state"] == "queued" and running_count() < MAX_RUNNING:
+            launch(m)
+
+
+# ---------- 帖子、回应、递送 ----------
+
+def next_post_id():
+    BOARD.mkdir(parents=True, exist_ok=True)
+    nums = [int(p.stem[1:]) for p in BOARD.glob("P*.json")]
+    return f"P{1 + max(nums or [0]):04d}"
+
+
+def post(pid):
+    p = jload(BOARD / f"{pid}.json")
+    if not p:
+        die(f"没有帖子 {pid}")
+    return p
+
+
+def pending_replies(name):
+    return [r for r in jlines(REPLIES) if r["conv"] == name and not r["forwarded"]]
+
+
+def mark_replies_forwarded(name):
+    with Lock("replies"):
+        rs = jlines(REPLIES)
+        for r in rs:
+            if r["conv"] == name:
+                r["forwarded"] = True
+        if REPLIES.exists():
+            REPLIES.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rs))
+
+
+def delivered_ids():
+    return {d["answer"] for d in jlines(DELIVERED)}
+
+
+def answers_of(name, from_turn=1):
+    m = meta(name)
+    return [(f"{name}#{n:03d}", paths(name, n)["out"])
+            for n in range(from_turn, m.get("turn", 0) + 1) if turn_state(name, n) == "answered"]
+
+
+def first_line(path):
+    for line in Path(path).read_text(errors="ignore").splitlines():
+        if line.strip():
+            return line.strip()[:80]
+    return "（空）"
+
+
+# ---------- 发一轮 ----------
+
+def build_message(m, n, post_ids, snap, extra):
+    parts = []
+    if n == 1:
+        brief = ROOT / "brief.md"
+        parts.append(f"先读你的说明：{SKILL / 'gemini.md'}\n项目目录：{PROJECT}"
+                     + (f"\n项目背景：{brief}" if brief.exists() else
+                        "\n项目背景：先看项目目录里的 README、CLAUDE.md 或 AGENTS.md（有哪个看哪个）"))
+    reps = pending_replies(m["name"])
+    if reps:
+        parts.append("## 你之前建议的处理结果\n" + "\n".join(
+            f"- {r['answer']}：{r['decision']}。{r['why']}" for r in reps))
+    for pid in post_ids:
+        p = post(pid)
+        parts.append(f"## Claude 的帖子 {pid}{'（方向性）' if p['dir'] else ''}\n{p['text']}")
+    if snap:
+        parts.append(f"## 本轮快照\n读这个文件：{snap}\n以它最后那一刻为准，之后的变化下一轮再说。")
+    if extra:
+        parts.append(extra)
+    return "\n\n".join(parts)
+
+
+def start_turn(name, post_ids=(), snap_from=None, extra="", anyway=False):
+    """snap_from：None 不带快照；"new" 从这个对话上次看到的位置截到现在；整数 从这个字节截到现在。"""
+    m = meta(name)
+    if m["state"] in ("running", "queued"):
+        die(f"{name} 这一轮还没完（{m['state']}）。等它结束，或者另开一个对话。")
+    last = f"{name}#{m.get('turn', 0):03d}"
+    if (not anyway and m.get("turn") and last in delivered_ids()
+            and not any(r["answer"] == last for r in jlines(REPLIES))):
+        die(f"{last} 已经交给主会话，但它还没回应。等它的回应（watch 会报 reply）一起带上，"
+            f"或者不等：加 --anyway。")
+    n = m.get("turn", 0) + 1
+    p = paths(name, n)
+    p["in"].parent.mkdir(parents=True, exist_ok=True)
+    snap_path = None
+    if snap_from is not None:
+        main = jload(MAIN) or die("主会话还没登记：gem main <会话.jsonl> --session <会话ID>")
+        start = m.get("watermark", 0) if snap_from == "new" else int(snap_from)
+        text, info = snapshot.render(main["path"], start)
+        p["snap"].write_text(text)
+        snap_path = p["snap"]
+        m["watermark"] = info["to_byte"]
+    p["in"].write_text(build_message(m, n, post_ids, snap_path, extra))
+    mark_replies_forwarded(name)
+    for pid in post_ids:
+        pp = post(pid)
+        pp.update(status="taken", conv=name, turn=n)
+        jsave(BOARD / f"{pid}.json", pp)
+    m.update(turn=n, state="queued", read_ref=progress())
+    save_meta(m)
+    refresh()
+    print(f"{name}#{n:03d} {meta(name)['state']}")
+
+
+# ---------- 命令 ----------
+
+def cmd_post(a):
+    text = Path(a.file).read_text() if a.file else " ".join(a.text)
+    if not text.strip():
+        die("帖子是空的")
+    with Lock("board"):
+        pid = next_post_id()
+        jsave(BOARD / f"{pid}.json", {"id": pid, "ts": now(), "dir": a.dir, "text": text,
+                                      "status": "new", "conv": None, "turn": None})
+    print(pid)
+
+
+def cmd_reply(a):
+    if a.decision not in ("采纳", "不采纳", "暂缓"):
+        die("决定只能是：采纳 / 不采纳 / 暂缓")
+    name = a.answer.split("#")[0]
+    if not (CONVS / name).exists():
+        die(f"没有回答 {a.answer}")
+    with Lock("replies"):
+        jappend(REPLIES, {"ts": now(), "answer": a.answer, "conv": name,
+                          "decision": a.decision, "why": " ".join(a.why), "forwarded": False})
+    print("已记下")
+
+
+def cmd_wait(a):
+    """前台最多等 150 秒（Bash 调用的上限）；--long 放后台用，一直等到有回答，最多两小时。"""
+    secs, t0 = (7200 if a.long else min(a.secs, 150)), now()
+    while True:
+        refresh()
+        p = post(a.post)
+        if p["conv"]:
+            got = answers_of(p["conv"], p["turn"])
+            if got:
+                done = delivered_ids()
+                for aid, path in got:
+                    print(f"ANSWERED {aid} {path}")
+                    if aid not in done:
+                        jappend(DELIVERED, {"answer": aid, "ts": now(), "how": "wait"})
+                return
+        if now() - t0 >= secs:
+            where = "还没被调度员接走" if not p["conv"] else f"在 {p['conv']}，{meta(p['conv'])['state']}"
+            print(f"PENDING {a.post} {where}。再调一次 gem wait {a.post}")
+            return
+        time.sleep(5)
+
+
+def cmd_main(a):
+    """会话记录的文件名 = scratchpad 路径里那段 UUID（不是 local_ 开头的会话 ID）。
+    scratchpad 形如 /tmp/claude-1000/<项目目录名>/<UUID>/scratchpad。"""
+    if a.scratchpad:
+        parts = Path(a.scratchpad).parts
+        idx = [i for i, p in enumerate(parts) if re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", p)]
+        if not idx or idx[-1] == 0:
+            die(f"scratchpad 路径里找不到会话 UUID：{a.scratchpad}")
+        i = idx[-1]
+        path = Path.home() / ".claude/projects" / parts[i - 1] / f"{parts[i]}.jsonl"
+    elif a.jsonl:
+        path = Path(a.jsonl).expanduser().resolve()
+    else:
+        die("给 --scratchpad <你的 scratchpad 路径>，或者直接给会话记录路径")
+    if not path.exists():
+        die(f"找不到会话记录 {path}")
+    jsave(MAIN, {"path": str(path), "session": a.session})
+    p = progress()
+    print(f"主会话已登记：{a.session or '（没给会话 ID）'}\n记录：{path}\n"
+          f"到目前：用户发了 {p['human']} 轮，后台通知等 {p['other']} 轮")
+
+
+def cmd_selftest(a):
+    ROOT.mkdir(parents=True, exist_ok=True)
+    os.execv(str(SKILL / "agy_consult.sh"), [str(SKILL / "agy_consult.sh"), "--selftest"])
+
+
+def cmd_broker(a):
+    m = jload(MAIN) or die("先登记主会话：gem main <会话.jsonl> --session <会话ID>")
+    m["broker"] = a.session
+    jsave(MAIN, m)
+    print(f"调度员已登记：{a.session}")
+
+
+def cmd_board(a):
+    refresh()
+    prog = progress()
+    if not prog:
+        print("!! 主会话还没登记（gem main <会话.jsonl> --session <会话ID>）")
+    else:
+        mm = jload(MAIN)
+        print(f"== 主会话 {mm.get('session') or '?'}（递消息就发给它）")
+        print(f"== 调度员 {mm['broker']}" if mm.get("broker") else "!! 还没有调度员（主会话按 SKILL.md 开一个）")
+    new = [jload(f) for f in sorted(BOARD.glob("P*.json"))] if BOARD.exists() else []
+    new = [p for p in new if p["status"] == "new"]
+    print(f"== 新帖 {len(new)}")
+    for p in new:
+        print(f"  {p['id']}{' [方向]' if p['dir'] else ''}  {p['text'].strip().splitlines()[0][:70]}")
+    done = delivered_ids()
+    print("== 没递的回答")
+    for m in all_metas():
+        for aid, path in answers_of(m["name"]):
+            if aid not in done:
+                print(f"  {aid}  {first_line(path)}\n      {path}\n      回答到了以后：{distance(m.get('done_ref'), prog)}")
+    print("== 在跑 / 排队")
+    for m in all_metas():
+        if m["state"] in ("running", "queued"):
+            print(f"  {m['name']}#{m['turn']:03d}  {m['state']}\n      它读到的地方以后：{distance(m.get('read_ref'), prog)}")
+    reps = [r for r in jlines(REPLIES) if not r["forwarded"]]
+    print(f"== 待转给 Gemini 的回应 {len(reps)}")
+    for r in reps:
+        print(f"  {r['answer']}  {r['decision']}  {r['why'][:60]}")
+
+
+def snap_arg(a):
+    if a.snap_from_byte is not None:
+        return a.snap_from_byte
+    return "new" if a.snap else None
+
+
+def cmd_open(a):
+    if (CONVS / a.name).exists():
+        die(f"{a.name} 已经有了，用 say 续")
+    jsave(CONVS / a.name / "meta.json", {"name": a.name, "kind": a.kind, "created": now(),
+                                         "conv_id": None, "turn": 0, "state": "new"})
+    start_turn(a.name, a.post or [], snap_arg(a), Path(a.msg).read_text() if a.msg else "")
+
+
+def cmd_say(a):
+    start_turn(a.name, a.post or [], snap_arg(a), Path(a.msg).read_text() if a.msg else "", a.anyway)
+
+
+def cmd_nudge(a):
+    """停下这一轮，接一句"时间到，先说看法"。实测：停掉之前读过的东西，它在下一轮还记得。"""
+    m = meta(a.name)
+    if m["state"] == "running":
+        kill_turn(m)
+        time.sleep(1)
+    m["state"] = "nudged"
+    save_meta(m)
+    start_turn(a.name, extra=NUDGE, anyway=True)
+
+
+def cmd_ls(a):
+    refresh()
+    prog = progress()
+    for m in all_metas():
+        line = f"{m['name']:<16} {m['kind']:<8} {m['state']:<9} 第{m['turn']}轮  对话ID={m.get('conv_id') or '?'}"
+        if m["state"] in ("running", "queued"):
+            line += f"\n{'':<16} 它读到的地方以后：{distance(m.get('read_ref'), prog)}"
+        print(line)
+
+
+def cmd_read(a):
+    refresh()
+    done = delivered_ids()
+    for aid, path in answers_of(a.name):
+        if a.all or aid not in done:
+            print(f"{aid}\t{first_line(path)}\t{path}")
+
+
+def cmd_delivered(a):
+    prev = [d for d in jlines(DELIVERED) if d["answer"] == a.answer]
+    if prev:
+        die(f"{a.answer} 已经递过了（{prev[0]['how']}），不用再发")
+    jappend(DELIVERED, {"answer": a.answer, "ts": now(), "how": a.how})
+    print("已记下")
+
+
+def cmd_close(a):
+    m = meta(a.name)
+    if m["state"] == "running":
+        kill_turn(m)
+    m["state"] = "closed"
+    save_meta(m)
+    print(f"{a.name} 已关")
+
+
+def cmd_watch(a):
+    """有事就打印事件并退出；没事等到 --timeout 秒打印 quiet。调度员用 run_in_background 跑它。
+    quiet 的时候看看 gem ls / gem board，自己判断要不要催、要不要补一批。"""
+    seen = jload(SEEN, {})
+    for k, v in (("posts", []), ("turns", []), ("replies", 0)):
+        seen.setdefault(k, v)
+    t0 = now()
+    while True:
+        refresh()
+        events = []
+        for f in sorted(BOARD.glob("P*.json")) if BOARD.exists() else []:
+            p = jload(f)
+            if p["status"] == "new" and p["id"] not in seen["posts"]:
+                events.append(f"new_post {p['id']}{' 方向' if p['dir'] else ''}")
+                seen["posts"].append(p["id"])
+        for m in all_metas():
+            n = m.get("turn", 0)
+            key = f"{m['name']}#{n:03d}"
+            if n and m["state"] not in ("running", "queued", "closed", "nudged") and key not in seen["turns"]:
+                note = "（主会话已经用 wait 拿到，不用再递）" if key in delivered_ids() else ""
+                events.append(f"{turn_state(m['name'], n)} {key}{note}")
+                seen["turns"].append(key)
+        nrep = len(jlines(REPLIES))
+        if nrep > seen["replies"]:
+            events.append(f"reply ×{nrep - seen['replies']}")
+            seen["replies"] = nrep
+        if events:
+            jsave(SEEN, seen)
+            print("\n".join(events))
+            return
+        if now() - t0 >= a.timeout:
+            print("quiet")
+            return
+        time.sleep(10)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="gem")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("post", help="Claude：发帖")
+    s.add_argument("--dir", action="store_true", help="方向性的")
+    s.add_argument("-f", "--file")
+    s.add_argument("text", nargs="*")
+    s.set_defaults(fn=cmd_post)
+
+    s = sub.add_parser("reply", help="Claude：回应一条回答")
+    s.add_argument("answer")
+    s.add_argument("decision")
+    s.add_argument("why", nargs="*")
+    s.set_defaults(fn=cmd_reply)
+
+    s = sub.add_parser("wait", help="Claude：等某个帖子的回答")
+    s.add_argument("post")
+    s.add_argument("secs", nargs="?", type=int, default=150)
+    s.add_argument("--long", action="store_true", help="放后台用：一直等到有回答")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("main", help="登记主会话记录")
+    s.add_argument("jsonl", nargs="?")
+    s.add_argument("--scratchpad", help="你的 scratchpad 路径，从里面认出会话记录")
+    s.add_argument("--session", help="主会话 ID（local_…），调度员发消息用")
+    s.set_defaults(fn=cmd_main)
+
+    s = sub.add_parser("broker", help="登记调度会话")
+    s.add_argument("session")
+    s.set_defaults(fn=cmd_broker)
+
+    for name, fn in (("board", cmd_board), ("ls", cmd_ls), ("selftest", cmd_selftest)):
+        sub.add_parser(name).set_defaults(fn=fn)
+
+    for name, fn in (("open", cmd_open), ("say", cmd_say)):
+        s = sub.add_parser(name)
+        s.add_argument("name")
+        if name == "open":
+            s.add_argument("--kind", choices=["follow", "question"], default="question")
+        s.add_argument("--post", action="append")
+        s.add_argument("--snap", action="store_true", help="带快照：从这个对话上次看到的位置截到现在")
+        s.add_argument("--snap-from-byte", type=int, help="带快照：从主会话记录的这个字节截到现在")
+        s.add_argument("--msg")
+        if name == "say":
+            s.add_argument("--anyway", action="store_true", help="上一轮主会话还没回应也照样发")
+        s.set_defaults(fn=fn)
+
+    for name, fn in (("nudge", cmd_nudge), ("close", cmd_close)):
+        s = sub.add_parser(name)
+        s.add_argument("name")
+        s.set_defaults(fn=fn)
+
+    s = sub.add_parser("read")
+    s.add_argument("name")
+    s.add_argument("--all", action="store_true")
+    s.set_defaults(fn=cmd_read)
+
+    s = sub.add_parser("delivered")
+    s.add_argument("answer")
+    s.add_argument("--how", default="now")
+    s.set_defaults(fn=cmd_delivered)
+
+    s = sub.add_parser("watch")
+    s.add_argument("--timeout", type=int, default=600)
+    s.set_defaults(fn=cmd_watch)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
