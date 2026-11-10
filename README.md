@@ -24,14 +24,27 @@ Claude Code skill：让 Gemini（Antigravity CLI `agy`）给 Claude 当外部顾
 
 ## 安装
 
+仓库：<https://github.com/fujioky/gemini-consult>
+
 ```bash
 # 项目级：装在哪个项目，就给哪个项目用
-git clone <这个仓库> <项目>/.claude/skills/gemini-consult
-# 或者用户级：项目目录取当前目录
-git clone <这个仓库> ~/.claude/skills/gemini-consult
+git clone https://github.com/fujioky/gemini-consult.git <项目>/.claude/skills/gemini-consult
 ```
 
-然后：
+```bash
+# 或者用户级：项目目录取当前目录
+git clone https://github.com/fujioky/gemini-consult.git ~/.claude/skills/gemini-consult
+```
+
+不用 git 的话，下载压缩包解压到同样的位置：<https://github.com/fujioky/gemini-consult/archive/refs/heads/main.zip>
+
+以后更新：
+
+```bash
+git -C <skill 目录> pull
+```
+
+装好后：
 
 1. 把 `<项目>/.gemini-consult/` 加进 `.gitignore`（状态目录）。
 2. 可选：`<项目>/.gemini-consult/config.json`，写模型、并发上限、额外要遮住的路径，格式见 `config.example.json`。
