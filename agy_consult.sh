@@ -2,6 +2,7 @@
 # 顾问专用沙箱（Linux，bubblewrap）：家目录和项目全部只读，只有 agy 自己的状态和缓存可写。
 # 遮住：常见凭据目录、Claude 原始会话记录（Gemini 只看过滤后的快照）、其他 Gemini 对话，
 #       以及 config.json 里 "mask" 列出的路径（gem 通过 GEM_MASK 传进来）。
+# skill 目录本身再露出来（只读）：装在 ~/.claude/skills 下时，它会跟着 ~/.claude 一起被遮住。
 # 用法: agy_consult.sh <对话名> [agy 参数...]      由 gem 调用，不手动调。
 # 自检: gem selftest                             不调 agy，只验证挂载
 # 没有 bwrap 时可设 GEM_SANDBOX=off：不进沙箱，agy 只放行读文件类工具（不能跑命令）。
@@ -41,6 +42,7 @@ jail() {   # $1 = 对外露出的那个 in/ 目录，其余参数是要跑的命
     --ro-bind "$PROJECT" "$PROJECT" \
     ${rw[@]+"${rw[@]}"} \
     ${m[@]+"${m[@]}"} \
+    --ro-bind "$SKILL" "$SKILL" \
     --tmpfs "$GEM" \
     --ro-bind "$in" "$in" \
     --chdir "$PROJECT" \
@@ -55,13 +57,18 @@ if [[ "${1:-}" == "--selftest" ]]; then
   echo "不该看到" > "$GEM/convs/_other/out/001.md"
   IN="$GEM/convs/_selftest/in"
   ok() { echo "  ✓ $1"; }; bad() { echo "  ✗ $1"; FAIL=1; }; FAIL=0
+  leaks() {   # 被遮住的目录里还露着什么（通往 skill 目录的那条路不算）
+    jail "$IN" find "$1" -mindepth 1 2>/dev/null | while read -r f; do
+      [[ "$f" == "$SKILL" || "$f" == "$SKILL"/* || "$SKILL" == "$f"/* ]] || echo "$f"
+    done
+  }
   jail "$IN" test -r "$PROJECT"                                  && ok "能读项目"          || bad "读不到项目"
   jail "$IN" sh -c "echo x > '$PROJECT/.gem_probe'" 2>/dev/null   && bad "项目能写"          || ok "项目写不进"
   jail "$IN" sh -c "echo x > '$H/.gem_probe'" 2>/dev/null         && bad "家目录能写"        || ok "家目录写不进"
   mapfile -t m < <(mask_args)
   for ((i = 0; i < ${#m[@]}; i++)); do
     case "${m[$i]}" in
-      --tmpfs)   p="${m[$((i+1))]}"; [[ -z "$(jail "$IN" ls -A "$p" 2>/dev/null)" ]] && ok "遮住 $p" || bad "$p 露着" ;;
+      --tmpfs)   p="${m[$((i+1))]}"; [[ -z "$(leaks "$p")" ]] && ok "遮住 $p" || bad "$p 露着" ;;
       --ro-bind) p="${m[$((i+2))]}"; [[ -z "$(jail "$IN" cat "$p" 2>/dev/null)" ]] && ok "遮住 $p" || bad "$p 露着" ;;
     esac
   done
