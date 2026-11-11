@@ -4,5 +4,6 @@
   "mask": [
     "~/.config/some-private-tool",
     "/path/to/other/repo/.secrets"
-  ]
+  ],
+  "auto_update": true
 }

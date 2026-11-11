@@ -19,6 +19,8 @@ description: 找 Gemini（Antigravity CLI）当外部顾问时用：开一个调
 
    会话记录的文件名是 scratchpad 路径里那段 UUID，不是会话 ID，gem 会自己认出来。
 
+   这一步也会顺带检查 skill 有没有新版本。输出里如果说"SKILL.md 有变化"，先重新读一遍它，按新版接着做。
+
 2. **开调度会话。** `$GEM board` 第二行如果写着"还没有调度员"，就用 `mcp__ccd_session__start_session` 开一个，参数：
    - `initiation`: `"user_asked"`，`context`: `"fresh"`，`use_worktree`: `false`
    - `model`: 一个 Sonnet 模型（如 `"claude-sonnet-5-5"`），`name`: `"gem-broker"`，`title`: `"Gemini 调度员"`

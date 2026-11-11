@@ -4,6 +4,7 @@
 Claude 用：  main / broker / post / reply / wait
 调度员用：   board / open / say / nudge / ls / read / delivered / close / watch
 检查沙箱：   selftest
+更新 skill：  update（main 开工时也会自动检查，一小时内最多一次）
 
 gem 不替谁做判断。它只记录：Gemini 每一轮读到主会话的哪里，之后主会话又多了几轮
 （用户发的、后台通知等别的）、过了多久。要不要催、什么时候递，调度员看着办。
@@ -365,6 +366,53 @@ def start_turn(name, post_ids=(), snap_from=None, extra="", anyway=False):
     print(f"{name}#{n:03d} {meta(name)['state']}")
 
 
+# ---------- 自动更新 ----------
+
+UPDATE_EVERY = 3600     # 自动检查的最短间隔（秒）
+
+
+def git(*args, timeout=20):
+    return subprocess.run(["git", "-C", str(SKILL), *args], capture_output=True, text=True,
+                          timeout=timeout, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+
+
+def self_update(force=False):
+    """skill 目录是 git clone 装的，就从远端快进到最新。返回要告诉 Claude 的话，没事返回空串。
+    只认 skill 目录自己的 .git（不碰它所在的项目仓库）；有本地改动、分叉、断网都跳过，不报错。"""
+    if not (SKILL / ".git").exists():
+        return "skill 不是用 git clone 装的，没法自动更新。" if force else ""
+    if not force:
+        if os.environ.get("GEM_AUTO_UPDATE", "1") == "0" or CONFIG.get("auto_update") is False:
+            return ""
+        stamp = SKILL / ".git" / "gem-update-checked"
+        if stamp.exists() and now() - stamp.stat().st_mtime < UPDATE_EVERY:
+            return ""
+        stamp.touch()
+    try:
+        if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            return "skill 目录里有本地改动，跳过更新。"
+        old = git("rev-parse", "HEAD").stdout.strip()
+        f = git("fetch", "--quiet")
+        if f.returncode:
+            return f"拉取失败，跳过更新：{f.stderr.strip()[:200]}" if force else ""
+        if git("merge", "--ff-only", "--quiet", "@{u}").returncode:
+            return "本地提交和远端分叉了，跳过更新。"
+        new = git("rev-parse", "HEAD").stdout.strip()
+        if new == old:
+            return "已经是最新。" if force else ""
+        log = git("log", "--format=  %h %s", f"{old}..{new}").stdout.rstrip()
+        msg = f"gemini-consult 已更新（{old[:7]} → {new[:7]}）：\n{log}"
+        if "SKILL.md" in git("diff", "--name-only", old, new).stdout.split():
+            msg += f"\nSKILL.md 有变化：先重新读一遍 {SKILL / 'SKILL.md'}，再接着开工。"
+        return msg
+    except Exception as e:      # 更新失败不能拖累开工
+        return f"更新出错，跳过：{e}" if force else ""
+
+
+def cmd_update(a):
+    print(self_update(force=True))
+
+
 # ---------- 命令 ----------
 
 def cmd_post(a):
@@ -432,6 +480,9 @@ def cmd_main(a):
     p = progress()
     print(f"主会话已登记：{a.session or '（没给会话 ID）'}\n记录：{path}\n"
           f"到目前：用户发了 {p['human']} 轮，后台通知等 {p['other']} 轮")
+    note = self_update()
+    if note:
+        print(note)
 
 
 def cmd_selftest(a):
@@ -623,7 +674,8 @@ def main():
     s.add_argument("session")
     s.set_defaults(fn=cmd_broker)
 
-    for name, fn in (("board", cmd_board), ("ls", cmd_ls), ("selftest", cmd_selftest)):
+    for name, fn in (("board", cmd_board), ("ls", cmd_ls), ("selftest", cmd_selftest),
+                     ("update", cmd_update)):
         sub.add_parser(name).set_defaults(fn=fn)
 
     for name, fn in (("open", cmd_open), ("say", cmd_say)):

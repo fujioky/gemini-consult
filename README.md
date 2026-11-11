@@ -107,13 +107,17 @@ git clone https://github.com/fujioky/gemini-consult.git <项目>/.claude/skills/
 git clone https://github.com/fujioky/gemini-consult.git ~/.claude/skills/gemini-consult
 ```
 
-不用 git 的话，下载 [zip](https://github.com/fujioky/gemini-consult/archive/refs/heads/main.zip)，解压后把 `gemini-consult-main` 改名成 `gemini-consult`，放到上面任一位置。
+不用 git 的话，下载 [zip](https://github.com/fujioky/gemini-consult/archive/refs/heads/main.zip)，解压后把 `gemini-consult-main` 改名成 `gemini-consult`，放到上面任一位置。zip 装的不会自动更新。
 
-以后更新：
+### 自动更新
 
-```bash
-git -C <skill 目录> pull
-```
+用 `git clone` 装的会自己更新：主会话每次开工登记时（`gem main`），顺带从 GitHub 拉一次新版本，一小时内最多查一次。
+
+- 只做快进。skill 目录里有你自己的改动、或者本地提交和远端分叉了，就跳过，不覆盖。
+- 断网、拉取失败也只是跳过，不影响开工。
+- 更新了 `SKILL.md` 的话，主会话会被提醒重新读一遍。
+- 手动更新：`<skill 目录>/gem update`。
+- 关掉：`config.json` 里写 `"auto_update": false`，或者设环境变量 `GEM_AUTO_UPDATE=0`。
 
 ### 2. 别把状态目录提交进 git
 
@@ -158,7 +162,8 @@ echo '.gemini-consult/' >> <项目>/.gitignore
 {
   "model": "gemini-4-carbon-high",
   "max_running": 4,
-  "mask": ["~/.config/some-private-tool", "/path/to/other/repo/.secrets"]
+  "mask": ["~/.config/some-private-tool", "/path/to/other/repo/.secrets"],
+  "auto_update": true
 }
 ```
 
@@ -167,6 +172,7 @@ echo '.gemini-consult/' >> <项目>/.gitignore
 | `model` | `gemini-4-carbon-high` | 传给 `agy --model` |
 | `max_running` | `4` | 最多同时跑几轮 Gemini，多出来的排队 |
 | `mask` | 空 | 除了默认遮住的凭据，再对 Gemini 藏起哪些路径，可以用 `~` |
+| `auto_update` | `true` | 开工时自动从 GitHub 更新 skill（见[自动更新](#自动更新)） |
 
 `<项目>/.gemini-consult/brief.md`：给 Gemini 的项目背景，一页以内就够，写清项目目标、现在做到哪、什么样的结果算好。没有这个文件，Gemini 第一轮会自己去读 README、CLAUDE.md 或 AGENTS.md。
 
@@ -177,6 +183,7 @@ echo '.gemini-consult/' >> <项目>/.gitignore
 | `GEM_PROJECT` | 项目目录 |
 | `GEM_ROOT` | 状态目录（默认 `<项目>/.gemini-consult`） |
 | `GEM_SANDBOX=off` | 不用沙箱 |
+| `GEM_AUTO_UPDATE=0` | 不自动更新 |
 | `GEM_MODEL`、`GEM_MAX_RUNNING` | 同 `config.json` 里的 `model`、`max_running` |
 
 ## 使用
@@ -269,6 +276,7 @@ echo '.gemini-consult/' >> <项目>/.gitignore
 | | `gem read <名字>`、`gem delivered <回答编号>`、`gem close <名字>` | 列回答、记下已递送、关闭对话 |
 | 都可以 | `gem board`、`gem ls` | 看全局、看对话 |
 | | `gem selftest` | 检查沙箱 |
+| | `gem update` | 手动更新 skill |
 
 ## 设计上的取舍
 
