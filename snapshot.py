@@ -9,7 +9,8 @@ lab 上一份会话记录有两亿多字节，大头是 api-request 之类的记
 看开头就能跳过，不用解析。
 
 去掉的东西：gem/agy 命令、读写 gemini/ 目录的工具调用（连同结果）、调度员发来的 [gem] 消息、
-app 自己的记账工具（任务清单、收尾框、ToolSearch）。思考块在会话记录里是空的，不处理。
+app 转来的调度员汇报（连同主会话被它叫醒的那一整轮）、app 自己的记账工具（任务清单、收尾框、ToolSearch）。
+思考块在会话记录里是空的，不处理。
 读文件的结果不放进快照，只写路径：Gemini 自己能读那个文件。
 """
 import argparse
@@ -62,9 +63,19 @@ def blocks(o):
 
 # ---------- 判断 ----------
 
+def is_broker_notice(text):
+    """调度员每结束一轮，app 转给主会话的汇报：'The session "Gemini 调度员" … finished a turn'。
+    调度员用 SendMessage 发的消息包在 <cross-session-message> 里，不算这个。"""
+    return ("Gemini 调度员" in text or "gem-broker" in text) and "<cross-session-message" not in text
+
+
 def is_advisor_message(text):
-    """调度员发来的 [gem] 消息，以及 app 转来的调度会话汇报。"""
-    return "[gem]" in text or "gem-broker" in text
+    """调度员发来的 [gem] 消息，以及 app 转来的调度员汇报。只用于不是用户本人发的消息。"""
+    return "[gem]" in text or is_broker_notice(text)
+
+
+def user_text(o):
+    return " ".join(b.get("text", "") for b in blocks(o) if b.get("type") == "text")
 
 
 def skip_tool(b):
@@ -94,14 +105,14 @@ ORIGIN_LABEL = {"human": "用户", "task_notification": "后台通知", "peer": 
 # ---------- 数轮次 ----------
 
 def count(path, start=0):
-    """数主会话新开了几轮：用户发的几轮，后台通知等别的几轮。调度员的 [gem] 消息不算。"""
+    """数主会话新开了几轮：用户发的几轮，后台通知等别的几轮。调度员的 [gem] 消息和汇报不算。"""
     human = other = 0
     end = start
     for end, o in entries(path, start):
         if o is None:
             break
         if o["type"] == "user" and o.get("turnOrigin"):
-            if is_advisor_message(" ".join(b.get("text", "") for b in blocks(o))):
+            if o["turnOrigin"] != "human" and is_advisor_message(user_text(o)):
                 continue
             if o["turnOrigin"] == "human":
                 human += 1
@@ -131,18 +142,23 @@ def render(path, start=0, max_result=1200):
     out, dropped, reads = [], set(), set()
     ts0 = ts1 = None
     end = start
+    notice_turn = False            # 主会话被调度员汇报叫醒的那一轮：整轮不给 Gemini 看
     for end, o in entries(path, start):
         if o is None:
             break
         ts = o.get("timestamp", "")[:16].replace("T", " ")
         ts0, ts1 = ts0 or ts, ts
+        if o["type"] == "user" and o.get("turnOrigin"):                # 新的一轮从这里开始
+            notice_turn = o["turnOrigin"] != "human" and is_broker_notice(user_text(o))
+        if notice_turn:
+            continue
         for b in blocks(o):
             k = b.get("type")
             if k == "text" and o["type"] == "assistant":
                 if b["text"].strip():
                     out.append(f"\n## Claude · {ts}\n{b['text'].strip()}")
             elif k == "text":
-                if not is_advisor_message(b["text"]):
+                if o.get("turnOrigin") == "human" or not is_advisor_message(b["text"]):
                     t = REMINDER.sub("", b["text"]).strip()
                     if t:
                         who = ORIGIN_LABEL.get(o.get("turnOrigin"), "用户")

@@ -197,7 +197,8 @@ echo '.gemini-consult/' >> <项目>/.gitignore
 
 ### 你会看到什么
 
-- 侧栏多出一个"Gemini 调度员"会话。它第一轮结束时会给主会话发一次汇报，之后在后台干活。
+- 侧栏多出一个"Gemini 调度员"会话。它只在有事时醒：来了新帖、Gemini 答完、Claude 回应了，或者有 Gemini 在跑、有回答没递时每 10 分钟看一眼。什么都没有就不动。
+- 调度员每处理完一件事，app 会通知主会话一次。主会话不回应这类通知，它也不会进 Gemini 看到的会话快照。
 - 主会话里时不时收到以 `[gem]` 开头的消息。Claude 会去读回答原文，然后 `gem reply`。
 - Claude 给你总结时，用到了 Gemini 的意见，会注明出处。
 - 你**不会**看到 Claude 在正文里讨论"Gemini 怎么说"。这是故意的：正文会进会话记录，下一轮被 Gemini 读到，两边就互相带偏了。
@@ -261,7 +262,7 @@ echo '.gemini-consult/' >> <项目>/.gitignore
 | | `gem post [--dir] "<打算>"`，或 `gem post -f <文件>` | 发帖，输出帖子编号 |
 | | `gem reply <回答编号> 采纳\|不采纳\|暂缓 "<理由>"` | 回应一条回答 |
 | | `gem wait <帖子> [--long]` | 等这个帖子的回答；`--long` 放后台用，最多等两小时 |
-| 调度员 | `gem watch` | 有事件就退出；10 分钟没事就打印 `quiet` 后退出 |
+| 调度员 | `gem watch` | 有事件就退出；有 Gemini 在跑或有回答没递时，安静 10 分钟打印 `quiet` 退出；什么都没有就一直等 |
 | | `gem open <名字> --kind follow\|question --post <帖子> [--snap \| --snap-from-byte N]` | 新开对话 |
 | | `gem say <名字> --post <帖子> [--snap] [--anyway]` | 在已有对话里续一轮 |
 | | `gem nudge <名字>` | 停下当前这一轮，让它按已经看到的先给看法 |

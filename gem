@@ -540,13 +540,23 @@ def cmd_close(a):
     print(f"{a.name} 已关")
 
 
+def in_flight():
+    """要调度员判断的事：在跑或排队的轮次（催不催），还没递给 Claude 的回答（什么时候递）。"""
+    metas = all_metas()
+    busy = sum(1 for m in metas if m["state"] in ("running", "queued"))
+    done = delivered_ids()
+    waiting = sum(1 for m in metas for aid, _ in answers_of(m["name"]) if aid not in done)
+    return busy, waiting
+
+
 def cmd_watch(a):
-    """有事就打印事件并退出；没事等到 --timeout 秒打印 quiet。调度员用 run_in_background 跑它。
-    quiet 的时候看看 gem ls / gem board，自己判断要不要催、要不要补一批。"""
+    """有事就打印事件并退出。调度员用 run_in_background 跑它。
+    没有事件时：有轮次在跑、或有回答没递，连着 --timeout 秒就打印 quiet 退出，让调度员看看要不要催、要不要递；
+    什么都没有就一直等。调度员每结束一轮，app 都会叫醒主会话一次，所以没事不叫醒调度员。"""
     seen = jload(SEEN, {})
     for k, v in (("posts", []), ("turns", []), ("replies", 0)):
         seen.setdefault(k, v)
-    t0 = now()
+    busy_since = None
     while True:
         refresh()
         events = []
@@ -570,9 +580,14 @@ def cmd_watch(a):
             jsave(SEEN, seen)
             print("\n".join(events))
             return
-        if now() - t0 >= a.timeout:
-            print("quiet")
-            return
+        busy, waiting = in_flight()
+        if busy or waiting:
+            busy_since = busy_since or now()
+            if now() - busy_since >= a.timeout:
+                print(f"quiet（在跑 {busy} 轮，没递的回答 {waiting} 条）")
+                return
+        else:
+            busy_since = None
         time.sleep(10)
 
 
@@ -639,7 +654,7 @@ def main():
     s.add_argument("--how", default="now")
     s.set_defaults(fn=cmd_delivered)
 
-    s = sub.add_parser("watch")
+    s = sub.add_parser("watch", help="调度员：等事件；有东西在跑或没递时，安静这么多秒就报 quiet")
     s.add_argument("--timeout", type=int, default=600)
     s.set_defaults(fn=cmd_watch)
 
