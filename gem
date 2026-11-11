@@ -59,7 +59,7 @@ import snapshot  # noqa: E402  （放在设好 GEM_ROOT 之后：它要据此认
 AGY = os.environ.get("GEM_AGY", str(SKILL / "agy_consult.sh"))       # 测试时可换成假的
 CONV_STORE = Path(os.environ.get("GEM_CONV_STORE",
                                  str(Path.home() / ".gemini/antigravity-cli/conversations")))
-MODEL = os.environ.get("GEM_MODEL", CONFIG.get("model", "gemini-4-argon-high"))
+MODEL = os.environ.get("GEM_MODEL", CONFIG.get("model", "gemini-4-carbon-high"))
 MAX_RUNNING = int(os.environ.get("GEM_MAX_RUNNING", CONFIG.get("max_running", 4)))
 NUDGE = "时间到。按你已经看到的，先说你现在的看法，再说你还想查什么。不要再读新东西。"
 

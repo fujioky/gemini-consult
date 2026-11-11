@@ -1,5 +1,5 @@
 {
-  "model": "gemini-4-argon-high",
+  "model": "gemini-4-carbon-high",
   "max_running": 4,
   "mask": [
     "~/.config/some-private-tool",

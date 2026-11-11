@@ -9,7 +9,7 @@
 让另一个模型帮忙把关，直接做会遇到三个问题：
 
 - **一个模型自己干长任务，容易一条路走到黑。** 误读一个结果、过早下一个结论，后面全跟着错。换一个模型从外面看，更容易发现。
-- **同步审查太慢。** Gemini 4 Argon（high）想一轮要几分钟到十几分钟。每一步都让 Claude 停下来等，整个任务就被拖住了。
+- **同步审查太慢。** 高推理档的 Gemini 想一轮要几分钟到十几分钟。每一步都让 Claude 停下来等，整个任务就被拖住了。
 - **两个模型直接对话，会互相带偏。** Claude 在正文里讨论 Gemini 的意见，Gemini 下一轮又读到这段讨论，几轮之后两边说的是同一套话。
 
 这个 skill 的做法：
@@ -87,7 +87,7 @@ Claude 在调一个训练任务，发现 loss 在第 2000 步之后开始震荡�
 ## 要求
 
 - **Claude Code 桌面版。** 调度员会话是主会话用 `start_session` 开的，回答用 `SendMessage` 递，这两个工具只有桌面版有。通过 SSH 连到远程机器的会话也可以。
-- **Antigravity CLI（`agy`）**，已登录，能用 Gemini 4 Argon。模型可以在配置里换。
+- **Antigravity CLI（`agy`）**，已登录。默认用 Gemini 4 Carbon（`gemini-4-carbon-high`），可以在配置里换成 `agy models` 列出的任何一个。
 - **Python 3.9+**，只用标准库。
 - **Linux + bubblewrap（`bwrap`）**，用来跑沙箱。macOS 或装不了 bwrap 的机器可以设 `GEM_SANDBOX=off`，代价见[安全](#安全gemini-能看到什么)。
 
@@ -156,7 +156,7 @@ echo '.gemini-consult/' >> <项目>/.gitignore
 
 ```json
 {
-  "model": "gemini-4-argon-high",
+  "model": "gemini-4-carbon-high",
   "max_running": 4,
   "mask": ["~/.config/some-private-tool", "/path/to/other/repo/.secrets"]
 }
@@ -164,7 +164,7 @@ echo '.gemini-consult/' >> <项目>/.gitignore
 
 | 字段 | 默认 | 作用 |
 |---|---|---|
-| `model` | `gemini-4-argon-high` | 传给 `agy --model` |
+| `model` | `gemini-4-carbon-high` | 传给 `agy --model` |
 | `max_running` | `4` | 最多同时跑几轮 Gemini，多出来的排队 |
 | `mask` | 空 | 除了默认遮住的凭据，再对 Gemini 藏起哪些路径，可以用 `~` |
 
